@@ -1,0 +1,674 @@
+"""Dialog for selecting and running Nexus automated tests."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QBrush, QColor
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QSizePolicy,
+    QSpinBox,
+    QSplitter,
+    QTabWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from nexus_toolkit.config import save_config
+from nexus_toolkit.paths import FRONTEND_APP_DIR
+from nexus_toolkit.services.nexus_services import NexusServices
+from nexus_toolkit.services.nexus_tests import (
+    DEFAULT_NEXUS_TESTS_DIR,
+    DEFAULT_NEXUS_TESTS_GIT,
+    DEFAULT_VITE_URL,
+    SUITE_PRESETS,
+    TestRunOptions,
+    TestRunSummary,
+    check_vite_running,
+    ensure_repo_dir,
+    parse_test_display,
+)
+from nexus_toolkit.ui.design_system import (
+    COLOR_ERROR,
+    COLOR_MUTED,
+    COLOR_SUCCESS,
+    COLOR_TEXT_SOFT,
+    COLOR_WARNING,
+    SPACING_LG,
+    SPACING_MD,
+    SPACING_SM,
+)
+from nexus_toolkit.ui.front_dev_worker import FrontDevWorker
+from nexus_toolkit.ui.log_view import LogBridge, append_log_limited
+from nexus_toolkit.ui.nexus_tests_worker import TestsCollectWorker, TestsGitWorker, TestsRunWorker
+from nexus_toolkit.ui.widgets import (
+    add_dialog_footer,
+    make_log_view,
+    make_muted_label,
+    make_primary_button,
+    make_secondary_button,
+)
+
+
+class NexusTestsDialog(QDialog):
+    def __init__(self, services: NexusServices, parent=None) -> None:
+        super().__init__(parent)
+        self.services = services
+        self._git_worker: TestsGitWorker | None = None
+        self._collect_worker: TestsCollectWorker | None = None
+        self._run_worker: TestsRunWorker | None = None
+        self._front_worker: FrontDevWorker | None = None
+        self._nodeids: list[str] = []
+        self._last_summary: TestRunSummary | None = None
+        self._updating_checks = False
+        self._geometry_applied = False
+        self._log_bridge = LogBridge()
+
+        self.setWindowTitle("Run Automated Tests")
+        self.setMinimumSize(1100, 780)
+
+        tests_cfg = self.services.config.setdefault("tests", {})
+        layout = QVBoxLayout(self)
+        layout.setSpacing(SPACING_MD)
+        layout.setContentsMargins(SPACING_MD, SPACING_MD, SPACING_MD, SPACING_MD)
+
+        layout.addWidget(
+            make_muted_label(
+                "בחר suite, רענן רשימה, סמן טסטים, והרץ. "
+                "תוצאות ולוג חי יופיעו בלשוניות מימין."
+            )
+        )
+
+        # --- Repository ---
+        layout.addWidget(_section_title("Repository"))
+        path_row = QHBoxLayout()
+        path_row.setSpacing(SPACING_SM)
+        self.repo_edit = QLineEdit(str(tests_cfg.get("repo_dir") or DEFAULT_NEXUS_TESTS_DIR))
+        browse_btn = make_secondary_button("Browse…")
+        browse_btn.clicked.connect(self._on_browse_repo)
+        self.git_btn = make_secondary_button("Clone / Update from Git")
+        self.git_btn.clicked.connect(self._on_git_update)
+        path_row.addWidget(QLabel("Repo:"))
+        path_row.addWidget(self.repo_edit, stretch=1)
+        path_row.addWidget(browse_btn)
+        path_row.addWidget(self.git_btn)
+        layout.addLayout(path_row)
+
+        git_row = QHBoxLayout()
+        git_row.setSpacing(SPACING_SM)
+        self.git_url_edit = QLineEdit(str(tests_cfg.get("git_url") or DEFAULT_NEXUS_TESTS_GIT))
+        git_row.addWidget(QLabel("Git URL:"))
+        git_row.addWidget(self.git_url_edit, stretch=1)
+        layout.addLayout(git_row)
+
+        # --- Suite & Options (fixed height — must not be crushed by splitter) ---
+        layout.addWidget(_section_title("Suite & Options"))
+        suite_row = QHBoxLayout()
+        suite_row.setSpacing(SPACING_SM)
+        self.suite_combo = QComboBox()
+        for name in SUITE_PRESETS:
+            self.suite_combo.addItem(name)
+        self.suite_combo.setMinimumWidth(180)
+        self.refresh_btn = make_secondary_button("Refresh Test List")
+        self.refresh_btn.clicked.connect(self._on_refresh_list)
+        suite_row.addWidget(QLabel("Suite:"))
+        suite_row.addWidget(self.suite_combo)
+        suite_row.addWidget(self.refresh_btn)
+        suite_row.addStretch()
+        layout.addLayout(suite_row)
+
+        self.headless_cb = QCheckBox("Headless")
+        self.headless_cb.setChecked(True)
+        self.headless_cb.setToolTip("Run browser without UI (HEADLESS=true)")
+        self.parallel_cb = QCheckBox("Parallel")
+        self.parallel_cb.setChecked(False)
+        self.parallel_workers = QSpinBox()
+        self.parallel_workers.setRange(1, 16)
+        self.parallel_workers.setValue(2)
+        self.parallel_workers.setEnabled(False)
+        self.parallel_cb.toggled.connect(self.parallel_workers.setEnabled)
+
+        self.allure_cb = QCheckBox("Allure")
+        self.allure_cb.setChecked(False)
+        self.drone_cb = QCheckBox("Drone tests")
+        self.drone_cb.setChecked(True)
+        self.drone_cb.setToolTip("--drone=True")
+        self.lab_cb = QCheckBox("Lab tests")
+        self.lab_cb.setChecked(False)
+        self.lab_cb.setToolTip("--lab=true")
+        self.flight_cb = QCheckBox("Flight only")
+        self.flight_cb.setChecked(False)
+        self.flight_cb.setToolTip("Filter to @pytest.mark.flight")
+
+        self.reruns_spin = QSpinBox()
+        self.reruns_spin.setRange(0, 5)
+        self.reruns_spin.setValue(1)
+        self.reruns_spin.setMinimumWidth(72)
+        self.browser_combo = QComboBox()
+        self.browser_combo.addItems(["chromium", "firefox", "webkit"])
+        self.browser_combo.setMinimumWidth(120)
+
+        options_host = QWidget()
+        options_host.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        options_grid = QGridLayout(options_host)
+        options_grid.setContentsMargins(0, 0, 0, 0)
+        options_grid.setHorizontalSpacing(SPACING_LG)
+        options_grid.setVerticalSpacing(SPACING_MD)
+        options_grid.addWidget(self.headless_cb, 0, 0)
+        parallel_wrap = QHBoxLayout()
+        parallel_wrap.setSpacing(SPACING_SM)
+        parallel_wrap.addWidget(self.parallel_cb)
+        parallel_wrap.addWidget(QLabel("workers:"))
+        parallel_wrap.addWidget(self.parallel_workers)
+        parallel_wrap.addStretch()
+        parallel_w = QWidget()
+        parallel_w.setLayout(parallel_wrap)
+        options_grid.addWidget(parallel_w, 0, 1)
+
+        options_grid.addWidget(self.allure_cb, 1, 0)
+        options_grid.addWidget(self.drone_cb, 1, 1)
+        options_grid.addWidget(self.lab_cb, 2, 0)
+        options_grid.addWidget(self.flight_cb, 2, 1)
+
+        rerun_row = QHBoxLayout()
+        rerun_row.setSpacing(SPACING_SM)
+        rerun_row.addWidget(QLabel("Reruns:"))
+        rerun_row.addWidget(self.reruns_spin)
+        rerun_row.addStretch()
+        rerun_w = QWidget()
+        rerun_w.setLayout(rerun_row)
+        options_grid.addWidget(rerun_w, 3, 0)
+
+        browser_row = QHBoxLayout()
+        browser_row.setSpacing(SPACING_SM)
+        browser_row.addWidget(QLabel("Browser:"))
+        browser_row.addWidget(self.browser_combo)
+        browser_row.addStretch()
+        browser_w = QWidget()
+        browser_w.setLayout(browser_row)
+        options_grid.addWidget(browser_w, 3, 1)
+        layout.addWidget(options_host)
+
+        # --- Tests ---
+        layout.addWidget(_section_title("Tests"))
+        select_row = QHBoxLayout()
+        select_row.setSpacing(SPACING_SM)
+        select_all_btn = make_secondary_button("Select All")
+        select_none_btn = make_secondary_button("Select None")
+        select_all_btn.clicked.connect(self._select_all)
+        select_none_btn.clicked.connect(self._select_none)
+        self.list_status = make_muted_label("לחץ Refresh Test List כדי לטעון טסטים.")
+        select_row.addWidget(select_all_btn)
+        select_row.addWidget(select_none_btn)
+        select_row.addWidget(self.list_status, stretch=1)
+        layout.addLayout(select_row)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, SPACING_SM, 0)
+        left_layout.setSpacing(SPACING_SM)
+        self.test_tree = QTreeWidget()
+        self.test_tree.setHeaderLabels(["Test", "Module"])
+        self.test_tree.setColumnCount(2)
+        self.test_tree.setUniformRowHeights(True)
+        self.test_tree.setRootIsDecorated(True)
+        self.test_tree.setMinimumWidth(420)
+        self.test_tree.setMinimumHeight(280)
+        self.test_tree.setToolTip("Grouped by area — hover a row for the full pytest nodeid")
+        self.test_tree.itemChanged.connect(self._on_tree_item_changed)
+        left_layout.addWidget(self.test_tree, stretch=1)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(SPACING_SM)
+        self.run_btn = make_primary_button("Run Selected")
+        self.run_btn.clicked.connect(self._on_run)
+        self.open_html_btn = make_secondary_button("Open HTML Report")
+        self.open_html_btn.setEnabled(False)
+        self.open_html_btn.clicked.connect(self._on_open_html)
+        action_row.addWidget(self.run_btn)
+        action_row.addWidget(self.open_html_btn)
+        action_row.addStretch()
+        left_layout.addLayout(action_row)
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(SPACING_SM, 0, 0, 0)
+        right_layout.setSpacing(SPACING_SM)
+
+        self.summary_label = make_muted_label("עדיין לא הורצו טסטים.")
+        self.summary_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.summary_label.setWordWrap(True)
+        right_layout.addWidget(self.summary_label)
+
+        self.output_tabs = QTabWidget()
+        self.results_list = QListWidget()
+        self.results_list.setToolTip("Results of the last run")
+        self.log_view = make_log_view(min_height=160)
+        self._log_bridge.line.connect(lambda line: append_log_limited(self.log_view, line))
+        self.output_tabs.addTab(self.results_list, "Results")
+        self.output_tabs.addTab(self.log_view, "Live Log")
+        right_layout.addWidget(self.output_tabs, stretch=1)
+
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([720, 480])
+        layout.addWidget(splitter, stretch=1)
+
+        add_dialog_footer(layout, self)
+        self._apply_default_geometry()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if not self._geometry_applied:
+            self._apply_default_geometry()
+            self._geometry_applied = True
+        ok, message = ensure_repo_dir(self._repo_dir())
+        if ok and not self._nodeids:
+            self.list_status.setText(message + " — לחץ Refresh Test List.")
+
+    def _apply_default_geometry(self) -> None:
+        """Open large by default (~90% of available screen), centered."""
+        screen = self.screen()
+        if screen is None:
+            app = QApplication.instance()
+            screen = app.primaryScreen() if app is not None else None
+        if screen is None:
+            self.resize(1280, 900)
+            return
+        avail = screen.availableGeometry()
+        width = max(self.minimumWidth(), min(1400, int(avail.width() * 0.92)))
+        height = max(self.minimumHeight(), min(980, int(avail.height() * 0.90)))
+        self.resize(width, height)
+        frame = self.frameGeometry()
+        frame.moveCenter(avail.center())
+        self.move(frame.topLeft())
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        if self._busy() or (self._front_worker is not None and self._front_worker.isRunning()):
+            from nexus_toolkit.ui.widgets import confirm_action
+
+            if not confirm_action(
+                self,
+                "טסטים רצים",
+                "יש פעולה פעילה (איסוף / הרצה / Front). לסגור בכל זאת?",
+            ):
+                event.ignore()
+                return
+        super().closeEvent(event)
+
+    def _repo_dir(self) -> Path:
+        return Path(self.repo_edit.text().strip() or str(DEFAULT_NEXUS_TESTS_DIR)).expanduser()
+
+    def _save_config(self) -> None:
+        tests_cfg = self.services.config.setdefault("tests", {})
+        tests_cfg["repo_dir"] = str(self._repo_dir())
+        tests_cfg["git_url"] = self.git_url_edit.text().strip() or DEFAULT_NEXUS_TESTS_GIT
+        save_config(self.services.config)
+
+    def _busy(self) -> bool:
+        return (
+            (self._git_worker is not None and self._git_worker.isRunning())
+            or (self._collect_worker is not None and self._collect_worker.isRunning())
+            or (self._run_worker is not None and self._run_worker.isRunning())
+        )
+
+    def _set_busy(self, busy: bool) -> None:
+        self.git_btn.setEnabled(not busy)
+        self.refresh_btn.setEnabled(not busy)
+        self.run_btn.setEnabled(not busy)
+        self.repo_edit.setEnabled(not busy)
+        self.git_url_edit.setEnabled(not busy)
+
+    def _on_browse_repo(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select nexus-tests directory", str(self._repo_dir()))
+        if path:
+            self.repo_edit.setText(path)
+            self._save_config()
+
+    def _on_git_update(self) -> None:
+        if self._busy():
+            return
+        self._save_config()
+        self.log_view.clear()
+        self.output_tabs.setCurrentWidget(self.log_view)
+        self._set_busy(True)
+        self._git_worker = TestsGitWorker(
+            self._repo_dir(),
+            self.git_url_edit.text().strip() or DEFAULT_NEXUS_TESTS_GIT,
+            parent=self,
+        )
+        self._git_worker.line.connect(self._log_bridge.line.emit)
+        self._git_worker.finished.connect(self._on_git_finished)
+        self._git_worker.start()
+
+    def _on_git_finished(self, ok: bool, message: str) -> None:
+        self._git_worker = None
+        self._set_busy(False)
+        self._log_bridge.line.emit(message)
+        if ok:
+            QMessageBox.information(self, "Git", message)
+        else:
+            QMessageBox.warning(self, "Git Failed", message)
+
+    def _current_suite(self) -> tuple[str, str]:
+        name = self.suite_combo.currentText()
+        return SUITE_PRESETS.get(name, ("tests/", ""))
+
+    def _on_refresh_list(self) -> None:
+        if self._busy():
+            return
+        self._save_config()
+        suite_path, markers = self._current_suite()
+        lab = self.lab_cb.isChecked() or name_is_lab(self.suite_combo.currentText())
+        if self.flight_cb.isChecked() and "flight" not in markers:
+            markers = "flight" if not markers else f"({markers}) and flight"
+
+        self.log_view.clear()
+        self.output_tabs.setCurrentWidget(self.log_view)
+        self.list_status.setText("Collecting tests…")
+        self._set_busy(True)
+        self._collect_worker = TestsCollectWorker(
+            self._repo_dir(),
+            suite_path,
+            markers,
+            drone=self.drone_cb.isChecked(),
+            lab=lab,
+            parent=self,
+        )
+        self._collect_worker.line.connect(self._log_bridge.line.emit)
+        self._collect_worker.finished.connect(self._on_collect_finished)
+        self._collect_worker.start()
+
+    def _on_collect_finished(self, ok: bool, nodeids: list, message: str) -> None:
+        self._collect_worker = None
+        self._set_busy(False)
+        self._nodeids = list(nodeids)
+        self._populate_test_tree(self._nodeids)
+        self.list_status.setText(message if ok else f"Collect failed: {message}")
+        if not ok:
+            QMessageBox.warning(self, "Collect Failed", message)
+
+    def _populate_test_tree(self, nodeids: list[str]) -> None:
+        self._updating_checks = True
+        self.test_tree.clear()
+        groups: dict[str, QTreeWidgetItem] = {}
+        for nodeid in nodeids:
+            info = parse_test_display(nodeid)
+            group_item = groups.get(info.group)
+            if group_item is None:
+                group_item = QTreeWidgetItem([info.group, ""])
+                group_item.setFlags(
+                    group_item.flags()
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsAutoTristate
+                )
+                group_item.setCheckState(0, Qt.CheckState.Checked)
+                group_item.setFirstColumnSpanned(True)
+                group_item.setForeground(0, QBrush(QColor(COLOR_TEXT_SOFT)))
+                group_item.setToolTip(0, f"{info.kind} group")
+                self.test_tree.addTopLevelItem(group_item)
+                groups[info.group] = group_item
+
+            child = QTreeWidgetItem([info.title, info.module])
+            child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            child.setCheckState(0, Qt.CheckState.Checked)
+            child.setData(0, Qt.ItemDataRole.UserRole, nodeid)
+            child.setToolTip(0, nodeid)
+            child.setToolTip(1, nodeid)
+            group_item.addChild(child)
+
+        self.test_tree.expandAll()
+        self.test_tree.resizeColumnToContents(0)
+        self.test_tree.setColumnWidth(0, max(280, self.test_tree.columnWidth(0)))
+        self._updating_checks = False
+
+    def _on_tree_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        if self._updating_checks or column != 0:
+            return
+        # Parent check toggles all children
+        if item.childCount() > 0 and not item.data(0, Qt.ItemDataRole.UserRole):
+            self._updating_checks = True
+            state = item.checkState(0)
+            for i in range(item.childCount()):
+                item.child(i).setCheckState(0, state)
+            self._updating_checks = False
+
+    def _select_all(self) -> None:
+        self._set_all_checks(Qt.CheckState.Checked)
+
+    def _select_none(self) -> None:
+        self._set_all_checks(Qt.CheckState.Unchecked)
+
+    def _set_all_checks(self, state: Qt.CheckState) -> None:
+        self._updating_checks = True
+        root = self.test_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            group = root.child(i)
+            group.setCheckState(0, state)
+            for j in range(group.childCount()):
+                group.child(j).setCheckState(0, state)
+        self._updating_checks = False
+
+    def _selected_nodeids(self) -> list[str]:
+        selected: list[str] = []
+        root = self.test_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            group = root.child(i)
+            for j in range(group.childCount()):
+                child = group.child(j)
+                if child.checkState(0) == Qt.CheckState.Checked:
+                    nodeid = child.data(0, Qt.ItemDataRole.UserRole)
+                    if nodeid:
+                        selected.append(str(nodeid))
+        return selected
+
+    def _build_options(self, selected: list[str]) -> TestRunOptions:
+        suite_path, markers = self._current_suite()
+        if self.flight_cb.isChecked() and "flight" not in markers:
+            markers = "flight" if not markers else f"({markers}) and flight"
+        return TestRunOptions(
+            headless=self.headless_cb.isChecked(),
+            parallel=self.parallel_cb.isChecked(),
+            parallel_workers=self.parallel_workers.value(),
+            allure=self.allure_cb.isChecked(),
+            drone=self.drone_cb.isChecked(),
+            lab=self.lab_cb.isChecked() or name_is_lab(self.suite_combo.currentText()),
+            flight=self.flight_cb.isChecked(),
+            reruns=self.reruns_spin.value(),
+            browser=self.browser_combo.currentText(),
+            marker_expression=markers,
+            suite_path=suite_path,
+        )
+
+    def _on_run(self) -> None:
+        if self._busy():
+            return
+        selected = self._selected_nodeids()
+        if not selected:
+            QMessageBox.information(self, "No Tests", "Select at least one test.")
+            return
+
+        self._save_config()
+        options = self._build_options(selected)
+
+        needs_front = any("/e2e/" in n or n.startswith("tests/e2e") for n in selected)
+        needs_front = needs_front or self.suite_combo.currentText() in {
+            "E2E only",
+            "Smoke",
+            "Sanity",
+            "All tests",
+            "Performance",
+            "Lab",
+            "Flight",
+        }
+        if needs_front:
+            ok, message = check_vite_running(DEFAULT_VITE_URL)
+            if not ok:
+                if not self._warn_front_missing(message):
+                    return
+
+        self.log_view.clear()
+        self.summary_label.setText("Running…")
+        self.results_list.clear()
+        self.open_html_btn.setEnabled(False)
+        self.output_tabs.setCurrentWidget(self.log_view)
+        self._set_busy(True)
+        self._run_worker = TestsRunWorker(self._repo_dir(), selected, options, parent=self)
+        self._run_worker.line.connect(self._log_bridge.line.emit)
+        self._run_worker.finished.connect(self._on_run_finished)
+        self._run_worker.start()
+
+    def _warn_front_missing(self, message: str) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Front לא רץ")
+        box.setText(
+            "ה-Front (Vite) לא זמין — טסטי UI עלולים להיכשל.\n\n"
+            f"{message}\n\n"
+            "אפשר להרים Front עכשיו או להמשיך בכל זאת."
+        )
+        start_btn = box.addButton("Start Front — הרם Front", QMessageBox.ButtonRole.ActionRole)
+        continue_btn = box.addButton("המשך בכל זאת", QMessageBox.ButtonRole.AcceptRole)
+        cancel_btn = box.addButton("ביטול", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == cancel_btn:
+            return False
+        if clicked == start_btn:
+            self._start_front()
+            return True
+        return clicked == continue_btn
+
+    def _start_front(self) -> None:
+        if self._front_worker is not None and self._front_worker.isRunning():
+            return
+        app_dir = FRONTEND_APP_DIR
+        frontend_cfg = self.services.config.get("frontend") or {}
+        configured = str(frontend_cfg.get("app_dir") or "").strip()
+        if configured:
+            app_dir = Path(configured).expanduser()
+        self.output_tabs.setCurrentWidget(self.log_view)
+        self._log_bridge.line.emit(f"Starting Front: {app_dir}")
+        self._front_worker = FrontDevWorker(self.services.frontend_runner, app_dir, parent=self)
+        self._front_worker.line.connect(self._log_bridge.line.emit)
+        self._front_worker.finished.connect(self._on_front_finished)
+        self._front_worker.start()
+
+    def _on_front_finished(self, success: bool, message: str) -> None:
+        self._log_bridge.line.emit(message)
+        if not success and "stopped" not in message.lower():
+            QMessageBox.warning(self, "Start Front", message)
+
+    def _on_run_finished(self, ok: bool, summary: object) -> None:
+        self._run_worker = None
+        self._set_busy(False)
+        if not isinstance(summary, TestRunSummary):
+            return
+        self._last_summary = summary
+        self._fill_results_list(summary)
+        self.output_tabs.setCurrentWidget(self.results_list)
+
+        html_ready = bool(summary.html_report and summary.html_report.is_file())
+        self.open_html_btn.setEnabled(html_ready)
+
+        text = (
+            f"Selected: {summary.selected_count}  ·  Ran: {summary.total_executed}\n"
+            f"Passed: {summary.passed}  ·  Failed: {summary.failed}  ·  "
+            f"Skipped: {summary.skipped}  ·  Errors: {summary.errors}  ·  Exit: {summary.exit_code}"
+        )
+        if html_ready:
+            text += f"\nHTML: {summary.html_report}"
+        self.summary_label.setText(text)
+
+        title = "Tests Passed" if ok else "Tests Finished with Failures"
+        detail = (
+            f"Selected: {summary.selected_count}\n"
+            f"Passed: {summary.passed}\n"
+            f"Failed: {summary.failed}\n"
+            f"Skipped: {summary.skipped}\n"
+            f"Errors: {summary.errors}"
+        )
+        if html_ready:
+            detail += "\n\nOpen HTML Report via the button in the dialog."
+        if ok:
+            QMessageBox.information(self, title, detail)
+        else:
+            QMessageBox.warning(self, title, detail)
+
+    def _fill_results_list(self, summary: TestRunSummary) -> None:
+        self.results_list.clear()
+        prefix = {
+            "passed": "PASS",
+            "failed": "FAIL",
+            "skipped": "SKIP",
+            "error": "ERROR",
+        }
+        colors = {
+            "passed": COLOR_SUCCESS,
+            "failed": COLOR_ERROR,
+            "error": COLOR_ERROR,
+            "skipped": COLOR_WARNING,
+        }
+        order = {"failed": 0, "error": 1, "skipped": 2, "passed": 3}
+        cases = sorted(summary.cases, key=lambda c: (order.get(c.outcome, 9), c.nodeid))
+        for case in cases:
+            info = parse_test_display(case.nodeid)
+            label = (
+                f"[{prefix.get(case.outcome, case.outcome.upper())}]  "
+                f"{info.group}  —  {info.title}"
+            )
+            item = QListWidgetItem(label)
+            tip = case.nodeid
+            if case.message:
+                tip += "\n\n" + case.message[:2000]
+            item.setToolTip(tip)
+            color = colors.get(case.outcome, COLOR_MUTED)
+            item.setForeground(QBrush(QColor(color)))
+            self.results_list.addItem(item)
+        if not cases and summary.selected_count:
+            self.results_list.addItem(
+                QListWidgetItem("(no per-test results — see Live Log / Open HTML Report)")
+            )
+
+    def _on_open_html(self) -> None:
+        if not self._last_summary or not self._last_summary.html_report:
+            return
+        path = self._last_summary.html_report
+        if not path.is_file():
+            QMessageBox.warning(self, "HTML Report", f"Report not found:\n{path}")
+            return
+        import webbrowser
+
+        webbrowser.open(path.as_uri())
+
+
+def _section_title(text: str) -> QLabel:
+    label = QLabel(text)
+    label.setProperty("class", "section-title")
+    label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+    return label
+
+
+def name_is_lab(suite_name: str) -> bool:
+    return suite_name.strip().lower() == "lab"
