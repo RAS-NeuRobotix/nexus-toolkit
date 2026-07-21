@@ -54,7 +54,7 @@ class TestsCollectWorker(QThread):
         self.lab = lab
 
     def run(self) -> None:
-        ok, nodeids, message = collect_tests(
+        ok, collected, message = collect_tests(
             self.repo_dir,
             suite_path=self.suite_path,
             marker_expression=self.marker_expression,
@@ -62,7 +62,11 @@ class TestsCollectWorker(QThread):
             lab=self.lab,
             on_line=self.line.emit,
         )
-        self.finished.emit(ok, nodeids, message)
+        # Emit plain dicts so queued Qt signals never drop dataclass fields.
+        payload = [
+            {"nodeid": item.nodeid, "description": item.description} for item in collected
+        ]
+        self.finished.emit(ok, payload, message)
 
 
 class TestsRunWorker(QThread):

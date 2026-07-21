@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -93,18 +94,27 @@ SUITE_PRESETS: dict[str, tuple[str, str]] = {
 
 
 @dataclass(frozen=True)
+class CollectedTest:
+    """One collected pytest item with its docstring description."""
+
+    nodeid: str
+    description: str = ""
+
+
+@dataclass(frozen=True)
 class TestDisplayInfo:
-    """Human-readable parts derived from a pytest nodeid."""
+    """Human-readable parts derived from a pytest nodeid (+ optional docstring)."""
 
     nodeid: str
     kind: str  # API, E2E, Performance, …
     group: str  # e.g. "API · nfz"
-    title: str  # short readable test name
+    title: str  # docstring description (preferred) or humanized name
     module: str  # file stem without test_ prefix
+    description: str = ""
 
 
-def parse_test_display(nodeid: str) -> TestDisplayInfo:
-    """Turn ``tests/api/nfz/test_nfz_api.py::test_foo[bar]`` into clear UI labels."""
+def parse_test_display(nodeid: str, description: str = "") -> TestDisplayInfo:
+    """Build UI labels; prefer the test docstring as the visible title."""
     path_part, _, func_part = nodeid.partition("::")
     path_part = path_part.replace("\\", "/")
     parts = [p for p in path_part.split("/") if p]
@@ -129,14 +139,35 @@ def parse_test_display(nodeid: str) -> TestDisplayInfo:
     package = " / ".join(package_parts) if package_parts else (module_stem or "misc")
     group = f"{kind} · {package}"
 
-    title = _humanize_test_function(func_part or module_stem or nodeid)
+    clean_doc = _normalize_description(description)
+    title = clean_doc or _humanize_test_function(func_part or module_stem or nodeid)
+    # Keep parametrize id visible when docstring is shared across params
+    _, bracket, params = (func_part or "").partition("[")
+    if clean_doc and bracket and params:
+        param = params.rstrip("]").strip()
+        if param and f"[{param}]" not in clean_doc:
+            title = f"{clean_doc}  [{param}]"
+
     return TestDisplayInfo(
         nodeid=nodeid,
         kind=kind,
         group=group,
         title=title,
         module=module_stem,
+        description=clean_doc,
     )
+
+
+def _normalize_description(text: str) -> str:
+    if not text:
+        return ""
+    # First non-empty line of the docstring is the display title
+    for line in text.strip().splitlines():
+        cleaned = " ".join(line.split()).strip()
+        if cleaned:
+            # Drop markdown/pytest double-backticks so UI reads cleanly
+            return cleaned.replace("``", "").replace("`", "")
+    return ""
 
 
 def _humanize_test_function(func_part: str) -> str:
@@ -154,6 +185,81 @@ def _humanize_test_function(func_part: str) -> str:
         if param:
             title = f"{title}  [{param}]"
     return title
+
+
+_COLLECT_PLUGIN = '''\
+"""Temp pytest plugin: write nodeid + docstring JSON for Nexus Toolkit."""
+from __future__ import annotations
+
+import inspect
+import json
+import os
+from pathlib import Path
+
+
+def _item_doc(item) -> str:
+    """Prefer the live function docstring (item.obj / item.function)."""
+    for candidate in (getattr(item, "obj", None), getattr(item, "function", None)):
+        if candidate is None:
+            continue
+        doc = inspect.getdoc(candidate) or getattr(candidate, "__doc__", None)
+        if doc:
+            return doc
+    return ""
+
+
+def pytest_collection_finish(session):
+    out = os.environ.get("NEXUS_TOOLKIT_COLLECT_JSON", "").strip()
+    if not out:
+        return
+    rows = [{"nodeid": item.nodeid, "description": _item_doc(item)} for item in session.items]
+    Path(out).write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+'''
+
+
+_RUN_PLUGIN = '''\
+"""Temp pytest plugin: print docstring titles in the live log."""
+from __future__ import annotations
+
+import inspect
+
+import pytest
+
+
+def _item_title(item) -> str:
+    doc = ""
+    for candidate in (getattr(item, "obj", None), getattr(item, "function", None)):
+        if candidate is None:
+            continue
+        doc = inspect.getdoc(candidate) or getattr(candidate, "__doc__", None) or ""
+        if doc:
+            break
+    for line in (doc or "").strip().splitlines():
+        cleaned = " ".join(line.split()).strip().replace("``", "").replace("`", "")
+        if cleaned:
+            nodeid = getattr(item, "nodeid", "") or ""
+            _, bracket, params = nodeid.partition("[")
+            if bracket and params:
+                param = params.rstrip("]").strip()
+                if param and f"[{param}]" not in cleaned:
+                    cleaned = f"{cleaned}  [{param}]"
+            return cleaned
+    return getattr(item, "nodeid", "") or "?"
+
+
+def pytest_runtest_setup(item):
+    print(f"\\n>>> {_item_title(item)}", flush=True)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    if report.when != "call" and not (report.when == "setup" and report.skipped):
+        return
+    status = (report.outcome or "?").upper()
+    print(f"[{status}] {_item_title(item)}", flush=True)
+'''
 
 
 def resolve_tests_python(repo_dir: Path) -> list[str]:
@@ -233,8 +339,8 @@ def collect_tests(
     drone: bool = True,
     lab: bool = False,
     on_line: Optional[OnLine] = None,
-) -> tuple[bool, list[str], str]:
-    """Return pytest nodeids via --collect-only."""
+) -> tuple[bool, list[CollectedTest], str]:
+    """Collect pytest items with docstring descriptions (no test execution)."""
     log = on_line or (lambda _msg: None)
     ok, message = ensure_repo_dir(repo_dir)
     if not ok:
@@ -242,6 +348,9 @@ def collect_tests(
 
     run_dir = _writable_run_dir()
     collect_log = run_dir / "collect.log"
+    collect_json = run_dir / "collect.json"
+    plugin_path = run_dir / "_nexus_toolkit_collect_plugin.py"
+    plugin_path.write_text(_COLLECT_PLUGIN, encoding="utf-8")
 
     python = resolve_tests_python(repo_dir)
     cmd = [
@@ -250,6 +359,8 @@ def collect_tests(
         "pytest",
         "--collect-only",
         "-q",
+        "-p",
+        "_nexus_toolkit_collect_plugin",
         "--override-ini",
         "addopts=",
         "--override-ini",
@@ -262,25 +373,96 @@ def collect_tests(
     target = suite_path.strip() or "tests/"
     cmd.append(target)
 
-    log("Running: " + " ".join(cmd))
+    env = _pytest_env(
+        {
+            "HEADLESS": "true",
+            "NEXUS_TOOLKIT_COLLECT_JSON": str(collect_json),
+            "PYTHONPATH": f"{run_dir}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+        }
+    )
+
+    log("Collecting tests…")
     result = subprocess.run(
         cmd,
         cwd=str(repo_dir),
         capture_output=True,
         text=True,
         timeout=180,
-        env=_pytest_env({"HEADLESS": "true"}),
+        env=env,
     )
     combined = (result.stdout or "") + "\n" + (result.stderr or "")
     for line in combined.splitlines():
-        if line.strip():
+        if _should_log_collect_line(line):
             log(line)
 
-    nodeids = _parse_collect_nodeids(result.stdout or "")
-    if result.returncode not in (0, 5) and not nodeids:
+    collected = _load_collected_tests(collect_json)
+    if not collected:
+        # Fallback: nodeids from stdout without descriptions (plugin missing / failed)
+        log(
+            "WARNING: collect plugin did not write descriptions "
+            f"({collect_json}); falling back to nodeids only"
+        )
+        collected = [
+            CollectedTest(nodeid=nodeid) for nodeid in _parse_collect_nodeids(result.stdout or "")
+        ]
+    elif not any(item.description for item in collected):
+        log(
+            "WARNING: collect returned empty descriptions for all tests — "
+            "UI will show humanized function names"
+        )
+
+    if result.returncode not in (0, 5) and not collected:
         # 5 = no tests collected
         return False, [], (result.stderr or result.stdout or "collect failed").strip()
-    return True, nodeids, f"Collected {len(nodeids)} tests"
+    return True, collected, f"Collected {len(collected)} tests"
+
+
+def _load_collected_tests(path: Path) -> list[CollectedTest]:
+    if not path.is_file():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    out: list[CollectedTest] = []
+    seen: set[str] = set()
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        nodeid = str(row.get("nodeid") or "").strip()
+        if not nodeid or nodeid in seen:
+            continue
+        seen.add(nodeid)
+        out.append(
+            CollectedTest(
+                nodeid=nodeid,
+                description=str(row.get("description") or ""),
+            )
+        )
+    return out
+
+
+def _should_log_collect_line(line: str) -> bool:
+    """Hide raw nodeids / discovery noise from Live Log during collect."""
+    s = line.strip()
+    if not s:
+        return False
+    lower = s.lower()
+    if "::" in s and (s.startswith("tests/") or s.startswith("tests\\")):
+        return False
+    if "drone ws discovery" in lower or "drone auto-discovery" in lower:
+        return False
+    if "using configured drone_id" in lower:
+        return False
+    if s.startswith("INTERNALERROR") or "error" in lower or "traceback" in lower:
+        return True
+    if "collected" in lower or "deselected" in lower:
+        return True
+    if s.startswith("="):
+        return False
+    return False
 
 
 _NODEID_RE = re.compile(r"^[\w./\\-]+::[\w\[\]-]+(?:::[\w\[\]-]+)?$")
@@ -336,6 +518,8 @@ def run_tests(
     html_report = run_dir / "report.html"
     junit_report = run_dir / "results.xml"
     run_log = run_dir / "pytest.log"
+    plugin_path = run_dir / "_nexus_toolkit_run_plugin.py"
+    plugin_path.write_text(_RUN_PLUGIN, encoding="utf-8")
     summary.html_report = html_report
     summary.junit_report = junit_report
     log(f"Reports directory: {run_dir}")
@@ -347,6 +531,8 @@ def run_tests(
         "pytest",
         "-v",
         "--tb=short",
+        "-p",
+        "_nexus_toolkit_run_plugin",
         "--override-ini",
         "addopts=",
         "--override-ini",
@@ -376,10 +562,15 @@ def run_tests(
 
     cmd.extend(selected_nodeids)
 
-    env = _pytest_env({"HEADLESS": "true" if options.headless else "false"})
+    env = _pytest_env(
+        {
+            "HEADLESS": "true" if options.headless else "false",
+            "PYTHONPATH": f"{run_dir}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+        }
+    )
 
     summary.command = " ".join(cmd)
-    log("Running: " + summary.command)
+    log(f"Running {len(selected_nodeids)} selected tests…")
     log(f"HEADLESS={env['HEADLESS']}")
 
     process = subprocess.Popen(
@@ -393,7 +584,9 @@ def run_tests(
     )
     assert process.stdout is not None
     for line in process.stdout:
-        log(line.rstrip("\n"))
+        text = line.rstrip("\n")
+        if _should_log_run_line(text):
+            log(text)
     exit_code = process.wait()
     summary.exit_code = exit_code
 
@@ -412,6 +605,35 @@ def run_tests(
     if summary.html_report and summary.html_report.is_file():
         log(f"HTML:     {summary.html_report}")
     return exit_code == 0, summary
+
+
+def _should_log_run_line(line: str) -> bool:
+    """Prefer description lines from our plugin; keep failures/tracebacks."""
+    s = line.strip()
+    if not s:
+        return False
+    if s.startswith(">>>") or s.startswith("[PASSED]") or s.startswith("[FAILED]"):
+        return True
+    if s.startswith("[SKIPPED]") or s.startswith("[ERROR]") or s.startswith("[XFAIL]"):
+        return True
+    if s.startswith("E ") or s.startswith(">") or "Error" in s or "Exception" in s:
+        return True
+    lower = s.lower()
+    if "passed" in lower and ("failed" in lower or "skipped" in lower or " in " in lower):
+        return True
+    if s.startswith("=== Summary") or s.startswith("Selected:") or s.startswith("Passed:"):
+        return True
+    if s.startswith("Failed:") or s.startswith("Skipped:") or s.startswith("Errors:") or s.startswith("HTML:"):
+        return True
+    if s.startswith("FAILED ") or s.startswith("ERROR ") or s.startswith("PASSED "):
+        return False
+    if "::" in s and s.startswith("tests/"):
+        return False
+    if "drone ws discovery" in lower or "drone auto-discovery" in lower:
+        return False
+    if s.startswith("Running ") or s.startswith("HEADLESS=") or s.startswith("Reports "):
+        return True
+    return False
 
 
 def _fill_summary_from_junit(summary: TestRunSummary, junit_path: Path) -> None:

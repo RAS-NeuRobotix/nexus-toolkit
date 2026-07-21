@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
 )
 
 from nexus_toolkit.config import save_config
-from nexus_toolkit.paths import FRONTEND_APP_DIR
+from nexus_toolkit.paths import resolve_frontend_app_dir
 from nexus_toolkit.services.azure_auth import check_azure_login, start_az_login
 from nexus_toolkit.services.nexus_services import NexusServices
 from nexus_toolkit.services.sudo_auth import ensure_sudo_for_deploy, is_sudo_cached
@@ -118,11 +118,7 @@ class NexusDeployTab(QWidget):
             self._on_front_stop()
 
     def _frontend_dir(self) -> Path:
-        frontend_cfg = self.services.config.get("frontend") or {}
-        configured = str(frontend_cfg.get("app_dir") or "").strip()
-        if configured:
-            return Path(configured).expanduser()
-        return FRONTEND_APP_DIR
+        return resolve_frontend_app_dir(self.services.config)
 
     def _sync_front_buttons(self) -> None:
         running = self.services.frontend_runner.running or (

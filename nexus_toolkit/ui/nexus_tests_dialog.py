@@ -5,8 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QBrush, QColor
+from PyQt6.QtGui import QAction, QBrush, QColor
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -18,6 +19,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QSizePolicy,
     QSpinBox,
@@ -30,13 +32,14 @@ from PyQt6.QtWidgets import (
 )
 
 from nexus_toolkit.config import save_config
-from nexus_toolkit.paths import FRONTEND_APP_DIR
+from nexus_toolkit.paths import resolve_frontend_app_dir
 from nexus_toolkit.services.nexus_services import NexusServices
 from nexus_toolkit.services.nexus_tests import (
     DEFAULT_NEXUS_TESTS_DIR,
     DEFAULT_NEXUS_TESTS_GIT,
     DEFAULT_VITE_URL,
     SUITE_PRESETS,
+    CollectedTest,
     TestRunOptions,
     TestRunSummary,
     check_vite_running,
@@ -47,6 +50,7 @@ from nexus_toolkit.ui.design_system import (
     COLOR_ERROR,
     COLOR_MUTED,
     COLOR_SUCCESS,
+    COLOR_TEXT,
     COLOR_TEXT_SOFT,
     COLOR_WARNING,
     SPACING_LG,
@@ -74,6 +78,7 @@ class NexusTestsDialog(QDialog):
         self._run_worker: TestsRunWorker | None = None
         self._front_worker: FrontDevWorker | None = None
         self._nodeids: list[str] = []
+        self._descriptions: dict[str, str] = {}
         self._last_summary: TestRunSummary | None = None
         self._updating_checks = False
         self._geometry_applied = False
@@ -89,8 +94,8 @@ class NexusTestsDialog(QDialog):
 
         layout.addWidget(
             make_muted_label(
-                "בחר suite, רענן רשימה, סמן טסטים, והרץ. "
-                "תוצאות ולוג חי יופיעו בלשוניות מימין."
+                "כתום = טסט נוכחי → כפתור Run This (בלי ✓). "
+                "✓ + Run Checked = כמה טסטים. לחיצה כפולה = הרצה מיידית."
             )
         )
 
@@ -227,23 +232,41 @@ class NexusTestsDialog(QDialog):
         left_layout.setContentsMargins(0, 0, SPACING_SM, 0)
         left_layout.setSpacing(SPACING_SM)
         self.test_tree = QTreeWidget()
-        self.test_tree.setHeaderLabels(["Test", "Module"])
-        self.test_tree.setColumnCount(2)
+        self.test_tree.setHeaderLabels(["Description"])
+        self.test_tree.setColumnCount(1)
         self.test_tree.setUniformRowHeights(True)
         self.test_tree.setRootIsDecorated(True)
         self.test_tree.setMinimumWidth(420)
         self.test_tree.setMinimumHeight(280)
-        self.test_tree.setToolTip("Grouped by area — hover a row for the full pytest nodeid")
+        self.test_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.test_tree.setToolTip(
+            "Double-click a test to run it alone. Right-click → Run this test. "
+            "Hover for the technical pytest id."
+        )
+        self.test_tree.header().setStretchLastSection(True)
         self.test_tree.itemChanged.connect(self._on_tree_item_changed)
+        self.test_tree.itemClicked.connect(self._on_tree_item_clicked)
+        self.test_tree.itemDoubleClicked.connect(self._on_tree_double_clicked)
+        self.test_tree.currentItemChanged.connect(self._on_current_item_changed)
+        self.test_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.test_tree.customContextMenuRequested.connect(self._on_tree_context_menu)
+        self._last_test_item: QTreeWidgetItem | None = None
+        self._last_nodeid: str | None = None
         left_layout.addWidget(self.test_tree, stretch=1)
 
         action_row = QHBoxLayout()
         action_row.setSpacing(SPACING_SM)
-        self.run_btn = make_primary_button("Run Selected")
+        self.run_one_btn = make_primary_button("Run This")
+        self.run_one_btn.setToolTip("Run the orange-highlighted test (✓ not required)")
+        self.run_one_btn.clicked.connect(self._on_run_highlighted)
+        self.run_btn = make_secondary_button("Run Checked")
+        self.run_btn.setToolTip("Run all tests marked with ✓")
+        self.run_btn.setStyleSheet(f"color: {COLOR_TEXT};")
         self.run_btn.clicked.connect(self._on_run)
         self.open_html_btn = make_secondary_button("Open HTML Report")
         self.open_html_btn.setEnabled(False)
         self.open_html_btn.clicked.connect(self._on_open_html)
+        action_row.addWidget(self.run_one_btn)
         action_row.addWidget(self.run_btn)
         action_row.addWidget(self.open_html_btn)
         action_row.addStretch()
@@ -337,6 +360,7 @@ class NexusTestsDialog(QDialog):
         self.git_btn.setEnabled(not busy)
         self.refresh_btn.setEnabled(not busy)
         self.run_btn.setEnabled(not busy)
+        self.run_one_btn.setEnabled(not busy)
         self.repo_edit.setEnabled(not busy)
         self.git_url_edit.setEnabled(not busy)
 
@@ -400,59 +424,104 @@ class NexusTestsDialog(QDialog):
         self._collect_worker.finished.connect(self._on_collect_finished)
         self._collect_worker.start()
 
-    def _on_collect_finished(self, ok: bool, nodeids: list, message: str) -> None:
+    def _on_collect_finished(self, ok: bool, collected: list, message: str) -> None:
         self._collect_worker = None
         self._set_busy(False)
-        self._nodeids = list(nodeids)
-        self._populate_test_tree(self._nodeids)
-        self.list_status.setText(message if ok else f"Collect failed: {message}")
+        items: list[CollectedTest] = []
+        for row in collected:
+            if isinstance(row, CollectedTest):
+                items.append(row)
+            elif isinstance(row, str):
+                items.append(CollectedTest(nodeid=row))
+            elif isinstance(row, dict):
+                items.append(
+                    CollectedTest(
+                        nodeid=str(row.get("nodeid") or ""),
+                        description=str(row.get("description") or ""),
+                    )
+                )
+        self._nodeids = [item.nodeid for item in items if item.nodeid]
+        self._descriptions = {
+            item.nodeid: item.description for item in items if item.nodeid
+        }
+        self._populate_test_tree(items)
+        missing = sum(1 for item in items if item.nodeid and not (item.description or "").strip())
         if not ok:
+            self.list_status.setText(f"Collect failed: {message}")
             QMessageBox.warning(self, "Collect Failed", message)
+        elif missing:
+            self.list_status.setText(f"{message} — {missing} without docstring (fallback name).")
+        else:
+            self.list_status.setText(message)
 
-    def _populate_test_tree(self, nodeids: list[str]) -> None:
+    def _populate_test_tree(self, collected: list[CollectedTest]) -> None:
         self._updating_checks = True
+        self.test_tree.blockSignals(True)
         self.test_tree.clear()
         groups: dict[str, QTreeWidgetItem] = {}
-        for nodeid in nodeids:
-            info = parse_test_display(nodeid)
+        for item in collected:
+            if not item.nodeid:
+                continue
+            info = parse_test_display(item.nodeid, item.description)
             group_item = groups.get(info.group)
             if group_item is None:
-                group_item = QTreeWidgetItem([info.group, ""])
+                # Group headers are labels only — no checkbox (avoids AutoTristate fighting one child).
+                group_item = QTreeWidgetItem([info.group])
                 group_item.setFlags(
-                    group_item.flags()
-                    | Qt.ItemFlag.ItemIsUserCheckable
-                    | Qt.ItemFlag.ItemIsAutoTristate
+                    Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
                 )
-                group_item.setCheckState(0, Qt.CheckState.Checked)
-                group_item.setFirstColumnSpanned(True)
                 group_item.setForeground(0, QBrush(QColor(COLOR_TEXT_SOFT)))
                 group_item.setToolTip(0, f"{info.kind} group")
                 self.test_tree.addTopLevelItem(group_item)
                 groups[info.group] = group_item
 
-            child = QTreeWidgetItem([info.title, info.module])
-            child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            child = QTreeWidgetItem([info.title])
+            child.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
             child.setCheckState(0, Qt.CheckState.Checked)
-            child.setData(0, Qt.ItemDataRole.UserRole, nodeid)
-            child.setToolTip(0, nodeid)
-            child.setToolTip(1, nodeid)
+            child.setData(0, Qt.ItemDataRole.UserRole, item.nodeid)
+            tip = item.nodeid
+            if info.description:
+                tip = f"{info.description}\n\n{item.nodeid}"
+            else:
+                tip = f"(no docstring)\n\n{item.nodeid}"
+            child.setToolTip(0, tip)
             group_item.addChild(child)
 
         self.test_tree.expandAll()
-        self.test_tree.resizeColumnToContents(0)
-        self.test_tree.setColumnWidth(0, max(280, self.test_tree.columnWidth(0)))
+        self._last_test_item = None
+        self._last_nodeid = None
+        self.test_tree.blockSignals(False)
         self._updating_checks = False
+
+    def _remember_test_item(self, item: QTreeWidgetItem | None) -> None:
+        nodeid = self._nodeid_from_item(item)
+        if not nodeid or item is None:
+            return
+        self._last_test_item = item
+        self._last_nodeid = nodeid
+        self.test_tree.setCurrentItem(item)
+
+    def _on_current_item_changed(
+        self,
+        current: QTreeWidgetItem | None,
+        _previous: QTreeWidgetItem | None,
+    ) -> None:
+        self._remember_test_item(current)
+
+    def _on_tree_item_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        """Remember the orange-highlighted test even when its ✓ is empty."""
+        self._remember_test_item(item)
 
     def _on_tree_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         if self._updating_checks or column != 0:
             return
-        # Parent check toggles all children
-        if item.childCount() > 0 and not item.data(0, Qt.ItemDataRole.UserRole):
-            self._updating_checks = True
-            state = item.checkState(0)
-            for i in range(item.childCount()):
-                item.child(i).setCheckState(0, state)
-            self._updating_checks = False
+        # Only leaf tests are checkable — no parent sync.
+        if self._nodeid_from_item(item):
+            self._remember_test_item(item)
 
     def _select_all(self) -> None:
         self._set_all_checks(Qt.CheckState.Checked)
@@ -462,12 +531,13 @@ class NexusTestsDialog(QDialog):
 
     def _set_all_checks(self, state: Qt.CheckState) -> None:
         self._updating_checks = True
+        self.test_tree.blockSignals(True)
         root = self.test_tree.invisibleRootItem()
         for i in range(root.childCount()):
             group = root.child(i)
-            group.setCheckState(0, state)
             for j in range(group.childCount()):
                 group.child(j).setCheckState(0, state)
+        self.test_tree.blockSignals(False)
         self._updating_checks = False
 
     def _selected_nodeids(self) -> list[str]:
@@ -501,27 +571,94 @@ class NexusTestsDialog(QDialog):
             suite_path=suite_path,
         )
 
-    def _on_run(self) -> None:
-        if self._busy():
+    def _nodeid_from_item(self, item: QTreeWidgetItem | None) -> str | None:
+        if item is None:
+            return None
+        nodeid = item.data(0, Qt.ItemDataRole.UserRole)
+        return str(nodeid) if nodeid else None
+
+    def _resolve_single_test_nodeid(self) -> str | None:
+        """Orange-highlighted / last-clicked test — independent of ✓ state."""
+        if self._last_nodeid:
+            return self._last_nodeid
+        for candidate in (self.test_tree.currentItem(), self._last_test_item):
+            nodeid = self._nodeid_from_item(candidate)
+            if nodeid:
+                return nodeid
+        current = self.test_tree.currentItem()
+        if current is not None and current.childCount() > 0:
+            return self._nodeid_from_item(current.child(0))
+        checked = self._selected_nodeids()
+        if len(checked) == 1:
+            return checked[0]
+        return None
+
+    def _on_tree_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        self._remember_test_item(item)
+        nodeid = self._nodeid_from_item(item)
+        if nodeid:
+            self._start_run([nodeid])
+
+    def _on_tree_context_menu(self, pos) -> None:
+        item = self.test_tree.itemAt(pos)
+        nodeid = self._nodeid_from_item(item)
+        if not nodeid or item is None:
             return
+        self._remember_test_item(item)
+        menu = QMenu(self)
+        run_action = QAction("Run this test", self)
+        run_action.triggered.connect(lambda: self._start_run([nodeid]))
+        menu.addAction(run_action)
+        check_only = QAction("Check only this test", self)
+        check_only.triggered.connect(lambda: self._check_only(item))
+        menu.addAction(check_only)
+        menu.exec(self.test_tree.viewport().mapToGlobal(pos))
+
+    def _check_only(self, item: QTreeWidgetItem) -> None:
+        self._set_all_checks(Qt.CheckState.Unchecked)
+        self._updating_checks = True
+        item.setCheckState(0, Qt.CheckState.Checked)
+        self._updating_checks = False
+        self._remember_test_item(item)
+
+    def _on_run_highlighted(self) -> None:
+        nodeid = self._resolve_single_test_nodeid()
+        if not nodeid:
+            QMessageBox.information(
+                self,
+                "No Test",
+                "לחץ על טסט ברשימה (השורה הכתומה) ואז Run This.\n"
+                "אין צורך לסמן ✓.",
+            )
+            return
+        self._start_run([nodeid])
+
+    def _on_run(self) -> None:
         selected = self._selected_nodeids()
         if not selected:
-            QMessageBox.information(self, "No Tests", "Select at least one test.")
+            nodeid = self._resolve_single_test_nodeid()
+            if nodeid:
+                self._start_run([nodeid])
+                return
+            QMessageBox.information(
+                self,
+                "No Tests",
+                "סמן טסטים ב־✓ להרצה מרובה, או לחץ על טסט ואז Run This.",
+            )
+            return
+        self._start_run(selected)
+
+    def _start_run(self, selected: list[str]) -> None:
+        if self._busy():
+            QMessageBox.information(self, "Busy", "פעולה אחרת עדיין רצה — המתן שתסתיים.")
+            return
+        if not selected:
             return
 
         self._save_config()
         options = self._build_options(selected)
 
         needs_front = any("/e2e/" in n or n.startswith("tests/e2e") for n in selected)
-        needs_front = needs_front or self.suite_combo.currentText() in {
-            "E2E only",
-            "Smoke",
-            "Sanity",
-            "All tests",
-            "Performance",
-            "Lab",
-            "Flight",
-        }
         if needs_front:
             ok, message = check_vite_running(DEFAULT_VITE_URL)
             if not ok:
@@ -529,7 +666,7 @@ class NexusTestsDialog(QDialog):
                     return
 
         self.log_view.clear()
-        self.summary_label.setText("Running…")
+        self.summary_label.setText(f"Running {len(selected)} test(s)…")
         self.results_list.clear()
         self.open_html_btn.setEnabled(False)
         self.output_tabs.setCurrentWidget(self.log_view)
@@ -563,11 +700,7 @@ class NexusTestsDialog(QDialog):
     def _start_front(self) -> None:
         if self._front_worker is not None and self._front_worker.isRunning():
             return
-        app_dir = FRONTEND_APP_DIR
-        frontend_cfg = self.services.config.get("frontend") or {}
-        configured = str(frontend_cfg.get("app_dir") or "").strip()
-        if configured:
-            app_dir = Path(configured).expanduser()
+        app_dir = resolve_frontend_app_dir(self.services.config)
         self.output_tabs.setCurrentWidget(self.log_view)
         self._log_bridge.line.emit(f"Starting Front: {app_dir}")
         self._front_worker = FrontDevWorker(self.services.frontend_runner, app_dir, parent=self)
@@ -633,13 +766,13 @@ class NexusTestsDialog(QDialog):
         order = {"failed": 0, "error": 1, "skipped": 2, "passed": 3}
         cases = sorted(summary.cases, key=lambda c: (order.get(c.outcome, 9), c.nodeid))
         for case in cases:
-            info = parse_test_display(case.nodeid)
-            label = (
-                f"[{prefix.get(case.outcome, case.outcome.upper())}]  "
-                f"{info.group}  —  {info.title}"
-            )
+            description = self._lookup_description(case.nodeid)
+            info = parse_test_display(case.nodeid, description)
+            label = f"[{prefix.get(case.outcome, case.outcome.upper())}]  {info.title}"
             item = QListWidgetItem(label)
             tip = case.nodeid
+            if info.description:
+                tip = f"{info.description}\n\n{case.nodeid}"
             if case.message:
                 tip += "\n\n" + case.message[:2000]
             item.setToolTip(tip)
@@ -650,6 +783,20 @@ class NexusTestsDialog(QDialog):
             self.results_list.addItem(
                 QListWidgetItem("(no per-test results — see Live Log / Open HTML Report)")
             )
+
+    def _lookup_description(self, nodeid: str) -> str:
+        if nodeid in self._descriptions:
+            return self._descriptions[nodeid]
+        # JUnit nodeids sometimes drop ".py"
+        for key, value in self._descriptions.items():
+            if key.replace(".py", "") == nodeid.replace(".py", ""):
+                return value
+            if key.endswith(nodeid) or nodeid.endswith(key.split("::")[-1]):
+                base = key.split("::")[-1].split("[")[0]
+                other = nodeid.split("::")[-1].split("[")[0]
+                if base == other:
+                    return value
+        return ""
 
     def _on_open_html(self) -> None:
         if not self._last_summary or not self._last_summary.html_report:

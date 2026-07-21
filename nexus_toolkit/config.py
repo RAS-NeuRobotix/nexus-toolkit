@@ -23,8 +23,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "drones": [],
     "tests": {
-        "repo_dir": str(Path.home() / "nexus-tests"),
+        "repo_dir": str(Path.home() / "nexus" / "nexus-tests"),
         "git_url": "git@github.com:RAS-NeuRobotix/nexus-tests.git",
+    },
+    "frontend": {
+        # Empty = auto-detect ~/nexus/ras-nexus-front/... then ~/ras-nexus-front/...
+        "app_dir": "",
     },
     "jira": {
         "fast_search": True,
