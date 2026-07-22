@@ -42,8 +42,11 @@ from nexus_toolkit.services.nexus_tests import (
     CollectedTest,
     TestRunOptions,
     TestRunSummary,
+    allure_dirs,
     check_vite_running,
     ensure_repo_dir,
+    list_allure_archives,
+    open_allure_report,
     parse_test_display,
 )
 from nexus_toolkit.ui.design_system import (
@@ -150,6 +153,7 @@ class NexusTestsDialog(QDialog):
 
         self.allure_cb = QCheckBox("Allure")
         self.allure_cb.setChecked(False)
+        self.allure_cb.setToolTip("Generate Allure report + keep last 20 runs")
         self.drone_cb = QCheckBox("Drone tests")
         self.drone_cb.setChecked(True)
         self.drone_cb.setToolTip("--drone=True")
@@ -266,9 +270,24 @@ class NexusTestsDialog(QDialog):
         self.open_html_btn = make_secondary_button("Open HTML Report")
         self.open_html_btn.setEnabled(False)
         self.open_html_btn.clicked.connect(self._on_open_html)
+        self.open_allure_btn = make_secondary_button("Open Allure")
+        self.open_allure_btn.setEnabled(False)
+        self.open_allure_btn.setToolTip("Open the latest Allure HTML report in the browser")
+        self.open_allure_btn.clicked.connect(self._on_open_allure)
+        self.allure_history_combo = QComboBox()
+        self.allure_history_combo.setMinimumWidth(160)
+        self.allure_history_combo.setToolTip("Last ≤20 archived Allure runs")
+        self.allure_history_combo.setEnabled(False)
+        self.open_allure_history_btn = make_secondary_button("Open History")
+        self.open_allure_history_btn.setEnabled(False)
+        self.open_allure_history_btn.setToolTip("Open the selected archived Allure run")
+        self.open_allure_history_btn.clicked.connect(self._on_open_allure_history)
         action_row.addWidget(self.run_one_btn)
         action_row.addWidget(self.run_btn)
         action_row.addWidget(self.open_html_btn)
+        action_row.addWidget(self.open_allure_btn)
+        action_row.addWidget(self.allure_history_combo)
+        action_row.addWidget(self.open_allure_history_btn)
         action_row.addStretch()
         left_layout.addLayout(action_row)
 
@@ -300,6 +319,7 @@ class NexusTestsDialog(QDialog):
 
         add_dialog_footer(layout, self)
         self._apply_default_geometry()
+        self._refresh_allure_history()
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
@@ -724,6 +744,11 @@ class NexusTestsDialog(QDialog):
 
         html_ready = bool(summary.html_report and summary.html_report.is_file())
         self.open_html_btn.setEnabled(html_ready)
+        allure_ready = bool(
+            summary.allure_report_dir and (summary.allure_report_dir / "index.html").is_file()
+        )
+        self.open_allure_btn.setEnabled(allure_ready or bool(list_allure_archives()))
+        self._refresh_allure_history()
 
         text = (
             f"Selected: {summary.selected_count}  ·  Ran: {summary.total_executed}\n"
@@ -732,6 +757,12 @@ class NexusTestsDialog(QDialog):
         )
         if html_ready:
             text += f"\nHTML: {summary.html_report}"
+        if allure_ready:
+            text += f"\nAllure: {summary.allure_report_dir}"
+        if summary.allure_archive_dir:
+            text += f"\nAllure archive: {summary.allure_archive_dir.name}"
+        if summary.allure_error:
+            text += f"\nAllure: {summary.allure_error}"
         self.summary_label.setText(text)
 
         title = "Tests Passed" if ok else "Tests Finished with Failures"
@@ -744,6 +775,10 @@ class NexusTestsDialog(QDialog):
         )
         if html_ready:
             detail += "\n\nOpen HTML Report via the button in the dialog."
+        if allure_ready:
+            detail += "\nOpen Allure via the button in the dialog."
+        elif summary.allure_error:
+            detail += f"\n\nAllure: {summary.allure_error}"
         if ok:
             QMessageBox.information(self, title, detail)
         else:
@@ -808,6 +843,61 @@ class NexusTestsDialog(QDialog):
         import webbrowser
 
         webbrowser.open(path.as_uri())
+
+    def _refresh_allure_history(self) -> None:
+        self.allure_history_combo.blockSignals(True)
+        self.allure_history_combo.clear()
+        archives = list_allure_archives()
+        for path in archives:
+            self.allure_history_combo.addItem(path.name, str(path))
+        has_archives = bool(archives)
+        self.allure_history_combo.setEnabled(has_archives)
+        self.open_allure_history_btn.setEnabled(has_archives)
+        latest = allure_dirs().report
+        if (latest / "index.html").is_file() or has_archives:
+            self.open_allure_btn.setEnabled(True)
+        self.allure_history_combo.blockSignals(False)
+
+    def _on_open_allure(self) -> None:
+        report_dir: Path | None = None
+        if self._last_summary and self._last_summary.allure_report_dir:
+            candidate = self._last_summary.allure_report_dir
+            if (candidate / "index.html").is_file():
+                report_dir = candidate
+        if report_dir is None:
+            latest = allure_dirs().report
+            if (latest / "index.html").is_file():
+                report_dir = latest
+        if report_dir is None:
+            archives = list_allure_archives()
+            if archives:
+                report_dir = archives[0]
+        if report_dir is None:
+            QMessageBox.warning(
+                self,
+                "Allure",
+                "No Allure report found yet.\nRun tests with Allure checked first.",
+            )
+            return
+        ok, message = open_allure_report(report_dir)
+        self._log_bridge.line.emit(message)
+        if not ok:
+            QMessageBox.warning(self, "Allure", message)
+
+    def _on_open_allure_history(self) -> None:
+        path_str = self.allure_history_combo.currentData()
+        if not path_str:
+            QMessageBox.warning(self, "Allure History", "No archived Allure run selected.")
+            return
+        report_dir = Path(str(path_str))
+        if not (report_dir / "index.html").is_file():
+            QMessageBox.warning(self, "Allure History", f"Report not found:\n{report_dir}")
+            self._refresh_allure_history()
+            return
+        ok, message = open_allure_report(report_dir)
+        self._log_bridge.line.emit(message)
+        if not ok:
+            QMessageBox.warning(self, "Allure History", message)
 
 
 def _section_title(text: str) -> QLabel:

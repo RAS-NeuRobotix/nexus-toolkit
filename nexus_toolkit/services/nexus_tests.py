@@ -5,12 +5,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import socket
 import subprocess
+import sys
+import time
+import webbrowser
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from urllib.request import urlopen
 
 from nexus_toolkit.paths import LOGS_DIR, NEXUS_TESTS_DIR, NEXUS_TESTS_GIT
@@ -19,6 +24,15 @@ DEFAULT_NEXUS_TESTS_DIR = NEXUS_TESTS_DIR
 DEFAULT_NEXUS_TESTS_GIT = NEXUS_TESTS_GIT
 DEFAULT_VITE_URL = "http://localhost:5173"
 TOOLKIT_TEST_RUNS_DIR = LOGS_DIR / "test-runs"
+TOOLKIT_ALLURE_ROOT = LOGS_DIR / "allure"
+ALLURE_HISTORY_MAX_BUILDS = 20
+ALLURE_ARCHIVE_MAX_RUNS = 20
+_ALLURE_TREND_JSON_FILES = (
+    "history-trend.json",
+    "duration-trend.json",
+    "retries-trend.json",
+    "categories-trend.json",
+)
 
 OnLine = Callable[[str], None]
 
@@ -72,12 +86,270 @@ class TestRunSummary:
     exit_code: int = 0
     html_report: Optional[Path] = None
     junit_report: Optional[Path] = None
+    allure_report_dir: Optional[Path] = None
+    allure_archive_dir: Optional[Path] = None
+    allure_error: str = ""
     cases: list[TestCaseResult] = field(default_factory=list)
     command: str = ""
 
     @property
     def total_executed(self) -> int:
         return self.passed + self.failed + self.skipped + self.errors
+
+
+@dataclass(frozen=True)
+class AllureDirs:
+    root: Path
+    results: Path
+    report: Path
+    runs: Path
+
+
+def allure_dirs() -> AllureDirs:
+    root = TOOLKIT_ALLURE_ROOT
+    return AllureDirs(
+        root=root,
+        results=root / "allure-results",
+        report=root / "allure-report",
+        runs=root / "runs",
+    )
+
+
+def _resolve_allure_bin(repo_dir: Path | None = None) -> str | None:
+    env_bin = os.environ.get("ALLURE_BIN", "").strip()
+    if env_bin and Path(env_bin).is_file():
+        return env_bin
+    which = shutil.which("allure")
+    if which:
+        return which
+    if repo_dir is not None:
+        local = repo_dir / ".tools" / "bin" / "allure"
+        if local.is_file():
+            return str(local)
+    return None
+
+
+def _allure_generate_argv(results_dir: Path, out_dir: Path, repo_dir: Path | None = None) -> list[str] | None:
+    allure_bin = _resolve_allure_bin(repo_dir)
+    r_abs = str(results_dir.resolve())
+    o_abs = str(out_dir.resolve())
+    if allure_bin:
+        return [allure_bin, "generate", r_abs, "-o", o_abs, "--clean"]
+    if shutil.which("npx"):
+        return ["npx", "--yes", "allure-commandline", "generate", r_abs, "-o", o_abs, "--clean"]
+    return None
+
+
+def _recompute_allure_statistic(items: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"failed": 0, "broken": 0, "skipped": 0, "passed": 0, "unknown": 0}
+    for it in items:
+        st = str(it.get("status", "unknown")).lower()
+        if st in counts:
+            counts[st] += 1
+        else:
+            counts["unknown"] += 1
+    counts["total"] = len(items)
+    return counts
+
+
+def _trim_allure_test_items(items: list[dict[str, Any]], max_runs: int) -> list[dict[str, Any]]:
+    if len(items) <= max_runs:
+        return items
+
+    def sort_key(it: dict[str, Any]) -> int:
+        t = it.get("time") or {}
+        return int(t.get("stop") or t.get("start") or 0)
+
+    return sorted(items, key=sort_key)[-max_runs:]
+
+
+def _trim_allure_history_json(path: Path, max_builds: int) -> None:
+    with path.open(encoding="utf-8") as f:
+        root = json.load(f)
+    if not isinstance(root, dict):
+        return
+    changed = False
+    for _hid, entry in root.items():
+        if not isinstance(entry, dict):
+            continue
+        items = entry.get("items")
+        if not isinstance(items, list):
+            continue
+        trimmed = _trim_allure_test_items(items, max_builds)
+        if len(trimmed) != len(items):
+            entry["items"] = trimmed
+            entry["statistic"] = _recompute_allure_statistic(trimmed)
+            changed = True
+    if changed:
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(root, f, ensure_ascii=False)
+
+
+def _trim_allure_trend_json(path: Path, max_builds: int) -> None:
+    with path.open(encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list) or len(data) <= max_builds:
+        return
+    ordered = sorted(data, key=lambda x: int(x.get("buildOrder") or 0))
+    trimmed = ordered[-max_builds:]
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(trimmed, f, ensure_ascii=False)
+
+
+def trim_allure_history_dir(history_dir: Path, max_builds: int = ALLURE_HISTORY_MAX_BUILDS) -> None:
+    """Keep only the last *max_builds* entries (Allure Report 2 ``history/`` layout)."""
+    hist_json = history_dir / "history.json"
+    if hist_json.is_file():
+        _trim_allure_history_json(hist_json, max_builds)
+    for name in _ALLURE_TREND_JSON_FILES:
+        p = history_dir / name
+        if p.is_file():
+            _trim_allure_trend_json(p, max_builds)
+
+
+def prepare_allure(
+    history_max: int = ALLURE_HISTORY_MAX_BUILDS,
+    on_line: Optional[OnLine] = None,
+) -> Path:
+    """Wipe toolkit allure-results; restore + trim history from the last report."""
+    log = on_line or (lambda _msg: None)
+    dirs = allure_dirs()
+    report_hist = dirs.report / "history"
+    results_hist = dirs.results / "history"
+    if report_hist.is_dir():
+        history_src: Path | None = report_hist
+    elif results_hist.is_dir():
+        history_src = results_hist
+    else:
+        history_src = None
+
+    if dirs.results.is_dir():
+        shutil.rmtree(dirs.results)
+    dirs.results.mkdir(parents=True, exist_ok=True)
+
+    if history_src is not None:
+        dest_hist = dirs.results / "history"
+        shutil.copytree(history_src, dest_hist)
+        log(f"Allure: restored history from {history_src}")
+        if history_max > 0:
+            trim_allure_history_dir(dest_hist, history_max)
+            log(f"Allure: trimmed history to last {history_max} build(s)")
+    else:
+        log(f"Allure: no prior history — Trends will start fresh at {dirs.results}")
+    return dirs.results
+
+
+def generate_allure_report(
+    repo_dir: Path | None = None,
+    on_line: Optional[OnLine] = None,
+) -> tuple[bool, Path | None, str]:
+    """Run ``allure generate`` into the toolkit allure-report directory."""
+    log = on_line or (lambda _msg: None)
+    dirs = allure_dirs()
+    if not dirs.results.is_dir():
+        return False, None, f"Allure results missing: {dirs.results}"
+    argv = _allure_generate_argv(dirs.results, dirs.report, repo_dir=repo_dir)
+    if not argv:
+        msg = (
+            "Allure CLI not found. Install Allure commandline, set ALLURE_BIN, "
+            "or ensure npx is available."
+        )
+        log(msg)
+        return False, None, msg
+    log(f"Allure: generating report → {dirs.report}")
+    result = subprocess.run(argv, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+        log(f"Allure generate failed: {err}")
+        return False, None, err
+    if not (dirs.report / "index.html").is_file():
+        msg = f"Allure generate produced no index.html under {dirs.report}"
+        log(msg)
+        return False, None, msg
+    log(f"Allure report: {dirs.report}")
+    return True, dirs.report, ""
+
+
+def archive_allure_report(
+    max_runs: int = ALLURE_ARCHIVE_MAX_RUNS,
+    stamp: str | None = None,
+    on_line: Optional[OnLine] = None,
+) -> Path | None:
+    """Copy the latest allure-report into runs/<stamp>/ and prune older archives."""
+    log = on_line or (lambda _msg: None)
+    dirs = allure_dirs()
+    if not (dirs.report / "index.html").is_file():
+        return None
+    stamp = stamp or datetime.now().strftime("%Y%m%d-%H%M%S")
+    dirs.runs.mkdir(parents=True, exist_ok=True)
+    dest = dirs.runs / stamp
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(dirs.report, dest)
+    log(f"Allure: archived as run {stamp}")
+
+    archives = sorted(
+        [p for p in dirs.runs.iterdir() if p.is_dir()],
+        key=lambda p: p.name,
+        reverse=True,
+    )
+    for old in archives[max(0, max_runs) :]:
+        try:
+            shutil.rmtree(old)
+            log(f"Allure: pruned old archive {old.name}")
+        except OSError as exc:
+            log(f"Allure: could not prune {old.name}: {exc}")
+    return dest
+
+
+def list_allure_archives() -> list[Path]:
+    """Newest-first list of archived Allure report directories (≤20 kept on disk)."""
+    runs = allure_dirs().runs
+    if not runs.is_dir():
+        return []
+    return sorted(
+        [p for p in runs.iterdir() if p.is_dir() and (p / "index.html").is_file()],
+        key=lambda p: p.name,
+        reverse=True,
+    )
+
+
+def _pick_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def open_allure_report(report_dir: Path | None = None) -> tuple[bool, str]:
+    """Serve an Allure HTML report over loopback HTTP and open the browser."""
+    dirs = allure_dirs()
+    root = (report_dir or dirs.report).resolve()
+    index = root / "index.html"
+    if not index.is_file():
+        return False, f"Allure index not found: {index}"
+    port = _pick_free_port()
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "http.server",
+            str(port),
+            "--bind",
+            "127.0.0.1",
+            "--directory",
+            str(root),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    url = f"http://127.0.0.1:{port}/"
+    time.sleep(0.4)
+    if proc.poll() is not None:
+        return False, f"HTTP server exited; try: python -m http.server --directory {root}"
+    webbrowser.open(url)
+    return True, f"Opened {url} (server PID {proc.pid})"
 
 
 SUITE_PRESETS: dict[str, tuple[str, str]] = {
@@ -553,12 +825,8 @@ def run_tests(
 
     # Selected nodeids already define the set — do not also apply -m filters.
     if options.allure:
-        allure_dir = repo_dir / "allure-results"
-        try:
-            allure_dir.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-        cmd.extend(["--alluredir", str(allure_dir)])
+        allure_results = prepare_allure(on_line=log)
+        cmd.extend(["--alluredir", str(allure_results)])
 
     cmd.extend(selected_nodeids)
 
@@ -595,6 +863,19 @@ def run_tests(
     else:
         log("JUnit report missing — summary counts may be incomplete")
 
+    if options.allure:
+        ok_gen, report_dir, err = generate_allure_report(repo_dir=repo_dir, on_line=log)
+        if ok_gen and report_dir is not None:
+            summary.allure_report_dir = report_dir
+            archive_stamp = stamp.replace("_", "-")
+            summary.allure_archive_dir = archive_allure_report(
+                stamp=archive_stamp,
+                on_line=log,
+            )
+        else:
+            summary.allure_error = err or "Allure generate failed"
+            log(f"Allure results kept at: {allure_dirs().results}")
+
     log("")
     log("=== Summary ===")
     log(f"Selected: {summary.selected_count}")
@@ -604,6 +885,12 @@ def run_tests(
     log(f"Errors:   {summary.errors}")
     if summary.html_report and summary.html_report.is_file():
         log(f"HTML:     {summary.html_report}")
+    if summary.allure_report_dir and (summary.allure_report_dir / "index.html").is_file():
+        log(f"Allure:   {summary.allure_report_dir}")
+    if summary.allure_archive_dir:
+        log(f"Allure archive: {summary.allure_archive_dir}")
+    if summary.allure_error:
+        log(f"Allure error: {summary.allure_error}")
     return exit_code == 0, summary
 
 
@@ -624,6 +911,8 @@ def _should_log_run_line(line: str) -> bool:
     if s.startswith("=== Summary") or s.startswith("Selected:") or s.startswith("Passed:"):
         return True
     if s.startswith("Failed:") or s.startswith("Skipped:") or s.startswith("Errors:") or s.startswith("HTML:"):
+        return True
+    if s.startswith("Allure:") or s.startswith("Allure "):
         return True
     if s.startswith("FAILED ") or s.startswith("ERROR ") or s.startswith("PASSED "):
         return False

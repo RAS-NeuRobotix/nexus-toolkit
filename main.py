@@ -47,19 +47,29 @@ from nexus_toolkit.services.cursor_sdk_patch import apply_cursor_sdk_patches
 
 apply_cursor_sdk_patches()
 
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 
 from nexus_toolkit.app import MainWindow
+from nexus_toolkit.app_icon import ensure_app_icon
 from nexus_toolkit.ui.styles import APP_STYLESHEET
 
 
 def main() -> int:
+    # Must match StartupWMClass / desktop file name so GNOME dock uses our icon.
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    app.setApplicationName("Nexus Toolkit")
+    app.setApplicationName("nexus-toolkit")
+    app.setApplicationDisplayName("Nexus Toolkit")
     app.setOrganizationName("Neurobotix")
+    app.setDesktopFileName("nexus-toolkit")
     app.setStyleSheet(APP_STYLESHEET)
+    icon_path = ensure_app_icon()
+    icon = QIcon(str(icon_path))
+    app.setWindowIcon(icon)
     window = MainWindow()
+    window.setWindowIcon(icon)
+    window.setWindowTitle("Nexus Toolkit")
     window.show()
     return app.exec()
 
